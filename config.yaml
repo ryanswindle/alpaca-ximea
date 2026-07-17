@@ -1,0 +1,23 @@
+entity: ximea
+# xiAPI shared library path. Typical locations:
+#   Linux:   /usr/lib/libm3api.so.2
+#   Windows: C:\XIMEA\API\xiAPI\xiapi64.dll
+#   macOS:   /Library/Frameworks/m3api.framework/m3api
+library: "/usr/lib/libm3api.so.2"
+server:
+  host: 0.0.0.0
+  port: 5920
+log_level: DEBUG
+devices:
+  - entity: Ximea_1
+    device_number: 0
+    serial_number: ""
+    defaults:
+      binning: 1
+      gain: 0
+      readout_mode: 0
+      temperature: -10
+      pixel_size: 3.45
+    readout_modes:
+      - label: "Zero_Gain"
+        gain: 0
