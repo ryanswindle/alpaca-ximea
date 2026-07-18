@@ -256,6 +256,16 @@ class CameraDevice:
             self._gain_max = 0.0
         logger.debug(f"gain range [{self._gain_min}, {self._gain_max}] dB")
 
+        # ROI capability. Some cameras — and the xiAPI camera simulator —
+        # report XI_NotImplemented for offsetX/offsetY or width/height and
+        # only ever deliver the full frame. Probe once so ROI handling
+        # degrades gracefully instead of failing the whole connection.
+        self._can_set_offset = self._is_settable_int(XI_PRM.OFFSET_X)
+        self._can_set_size = self._is_settable_int(XI_PRM.WIDTH)
+        logger.debug(
+            f"can_set_offset={self._can_set_offset}, can_set_size={self._can_set_size}"
+        )
+
         # Build readout modes from config (gain presets) or single default
         if self._config.readout_modes:
             self._readout_modes = [mode.label for mode in self._config.readout_modes]
@@ -298,18 +308,23 @@ class CameraDevice:
         self._set_full_frame()
 
     def _set_full_frame(self) -> None:
-        """Reset ROI to full frame at the current downsampling."""
-        self._set_int(XI_PRM.OFFSET_X, 0)
-        self._set_int(XI_PRM.OFFSET_Y, 0)
-        width = self._get_int(XI_PRM.WIDTH + XI_PRM.INFO_MAX)
-        height = self._get_int(XI_PRM.HEIGHT + XI_PRM.INFO_MAX)
-        self._set_int(XI_PRM.WIDTH, width)
-        self._set_int(XI_PRM.HEIGHT, height)
+        """Reset ROI to full frame at the current downsampling.
 
-        self._start_x = 0
-        self._start_y = 0
-        self._num_x = width
-        self._num_y = height
+        Offset and size are written only when the camera implements them;
+        where it doesn't (e.g. the xiAPI simulator) the sensor already
+        delivers its full frame, so we just read back the actual geometry.
+        """
+        if self._can_set_offset:
+            self._set_int(XI_PRM.OFFSET_X, 0)
+            self._set_int(XI_PRM.OFFSET_Y, 0)
+        if self._can_set_size:
+            self._set_int(XI_PRM.WIDTH, self._get_int(XI_PRM.WIDTH + XI_PRM.INFO_MAX))
+            self._set_int(XI_PRM.HEIGHT, self._get_int(XI_PRM.HEIGHT + XI_PRM.INFO_MAX))
+
+        self._start_x = self._get_int_or(XI_PRM.OFFSET_X, 0)
+        self._start_y = self._get_int_or(XI_PRM.OFFSET_Y, 0)
+        self._num_x = self._get_int(XI_PRM.WIDTH)
+        self._num_y = self._get_int(XI_PRM.HEIGHT)
 
     # ── xiAPI parameter helpers ──────────────────────────────────
     def _set_int(self, param: str, value: int) -> None:
@@ -339,6 +354,23 @@ class CameraDevice:
             return self._get_int(param)
         except XIError:
             return default
+
+    def _is_settable_int(self, param: str) -> bool:
+        """True if the camera accepts writes to an integer parameter.
+
+        Probes by writing the current value straight back — a no-op for
+        cameras that implement the parameter, and XI_NotImplemented (or
+        another error) for those that don't.
+        """
+        try:
+            current = self._get_int(param)
+        except XIError:
+            return False
+        try:
+            self._set_int(param, current)
+            return True
+        except XIError:
+            return False
 
     def _set_float(self, param: str, value: float) -> None:
         xi_call(
@@ -746,12 +778,21 @@ class CameraDevice:
         nx = num_x if num_x is not None else self._num_x
         ny = num_y if num_y is not None else self._num_y
 
-        # Max binned dimensions (offsets zeroed first so width:max /
-        # height:max report the full binned frame)
-        self._set_int(XI_PRM.OFFSET_X, 0)
-        self._set_int(XI_PRM.OFFSET_Y, 0)
+        # Max binned dimensions (offsets zeroed first, where settable, so
+        # width:max / height:max report the full binned frame)
+        if self._can_set_offset:
+            self._set_int(XI_PRM.OFFSET_X, 0)
+            self._set_int(XI_PRM.OFFSET_Y, 0)
         max_binned_x = self._get_int(XI_PRM.WIDTH + XI_PRM.INFO_MAX)
         max_binned_y = self._get_int(XI_PRM.HEIGHT + XI_PRM.INFO_MAX)
+
+        # Cameras that don't implement size or offset can only deliver the
+        # full frame; reject a request that would change the fixed axis
+        # rather than silently ignoring it (→ ASCOM InvalidValue).
+        if not self._can_set_size and (nx != max_binned_x or ny != max_binned_y):
+            raise ValueError("Camera does not support sub-frame width/height")
+        if not self._can_set_offset and (sx != 0 or sy != 0):
+            raise ValueError("Camera does not support sub-frame offset")
 
         # Validate and clamp start values
         if sx < 0:
@@ -797,11 +838,14 @@ class CameraDevice:
         if sy + ny > max_binned_y:
             sy = ((max_binned_y - ny) // offset_y_inc) * offset_y_inc
 
-        # Set size first (offsets are already zeroed), then position
-        self._set_int(XI_PRM.WIDTH, nx)
-        self._set_int(XI_PRM.HEIGHT, ny)
-        self._set_int(XI_PRM.OFFSET_X, sx)
-        self._set_int(XI_PRM.OFFSET_Y, sy)
+        # Set size first (offsets already zeroed where supported), then
+        # position — each only when the camera implements it.
+        if self._can_set_size:
+            self._set_int(XI_PRM.WIDTH, nx)
+            self._set_int(XI_PRM.HEIGHT, ny)
+        if self._can_set_offset:
+            self._set_int(XI_PRM.OFFSET_X, sx)
+            self._set_int(XI_PRM.OFFSET_Y, sy)
 
         self._start_x = sx
         self._start_y = sy
