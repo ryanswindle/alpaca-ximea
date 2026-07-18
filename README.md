@@ -1,8 +1,7 @@
-# ASCOM Alpaca Server for Ximea cameras (xiAPI)
+# ASCOM Alpaca Server for Ximea camera (xiAPI)
 
-A FastAPI-based server, implementing the ASCOM **ICameraV4** interface. Communication is via XIMEA's published xiAPI
-library, loaded directly with ctypes — no vendor Python package required. Works on Windows, Linux and macOS wherever
-the XIMEA software package is installed.
+A FastAPI-based server, implementing the ASCOM **ICameraV4** interface. Communication is via published xiAPI
+library, tested up to 4.32.00.00.
 
 ---
 
