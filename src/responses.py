@@ -139,12 +139,18 @@ class ImageArrayResponse(PropertyResponse):
     ) -> "ImageArrayResponse":
         # Infer Type and Rank from the supplied array so JSON and ImageBytes
         # paths both report correct metadata (including Rank=3 for RGB24).
+        # Type is the ASCOM ImageArray element type — Int32 for all integer
+        # data per the ICameraV4 contract; the narrower native dtype is a
+        # transmission format only (see to_imagebytes).
         err = error or Success()
         if err.Number == 0 and value is not None:
             arr = np.asarray(value)
-            element_type = _DTYPE_TO_ELEMENT_TYPE.get(
-                arr.dtype, ImageArrayElementTypes.UNKNOWN
-            )
+            if np.issubdtype(arr.dtype, np.integer):
+                element_type = ImageArrayElementTypes.INT32
+            else:
+                element_type = _DTYPE_TO_ELEMENT_TYPE.get(
+                    arr.dtype, ImageArrayElementTypes.UNKNOWN
+                )
             rank = arr.ndim
             value_out = arr
         else:
@@ -165,11 +171,16 @@ class ImageArrayResponse(PropertyResponse):
         """Convert the image array to ASCOM ImageBytes format."""
         if self.ErrorNumber == 0 and self.Value is not None:
             value = np.asarray(self.Value)
-            element_type = self.Type
-            if element_type == ImageArrayElementTypes.UNKNOWN:
+            # Transmission uses the narrow native dtype (halves bandwidth for
+            # uint16 sensors); ImageElementType stays the ASCOM array type
+            # (self.Type, Int32 for integer data) and clients upcast.
+            transmission_type = _DTYPE_TO_ELEMENT_TYPE.get(
+                value.dtype, ImageArrayElementTypes.UNKNOWN
+            )
+            if transmission_type == ImageArrayElementTypes.UNKNOWN:
                 # Unsupported dtype — coerce to uint16 as a safe default.
                 value = value.astype(np.uint16, order="C")
-                element_type = int(ImageArrayElementTypes.UINT16)
+                transmission_type = ImageArrayElementTypes.UINT16
             else:
                 value = np.ascontiguousarray(value)
 
@@ -184,8 +195,8 @@ class ImageArrayResponse(PropertyResponse):
                 self.ClientTransactionID,  # ClientTransactionID
                 self.ServerTransactionID,  # ServerTransactionID
                 IMAGEBYTES_HEADER_SIZE,  # DataStart
-                element_type,  # ImageElementType
-                element_type,  # TransmissionElementType
+                self.Type,  # ImageElementType
+                int(transmission_type),  # TransmissionElementType
                 self.Rank,  # Rank
                 dim1,  # Dimension1
                 dim2,  # Dimension2

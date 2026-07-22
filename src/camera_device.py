@@ -168,6 +168,10 @@ class CameraDevice:
             self._connected = True
             self._camera_state = CameraState.IDLE
             self._image_ready = False
+            # A fresh connection has taken no exposures — LastExposure* must
+            # error until the first StartExposure of this session.
+            self._last_exposure_duration = None
+            self._last_exposure_start_time = None
             logger.info(f"Connected to camera {self._config.entity}")
 
         except Exception as e:
@@ -415,10 +419,19 @@ class CameraDevice:
 
     @connected.setter
     def connected(self, value: bool) -> None:
+        # Legacy synchronous semantics: Connected Set must not return until
+        # the attempt completes (Connect()/Disconnect() with Connecting are
+        # the asynchronous path).
         if value and not self._connected:
             self.connect()
+            if self._connect_thread is not None:
+                self._connect_thread.join()
+            if not self._connected:
+                raise RuntimeError("Connect failed (see server log)")
         elif not value and self._connected:
             self.disconnect()
+            if self._disconnect_thread is not None:
+                self._disconnect_thread.join()
 
     @property
     def connecting(self) -> bool:
@@ -427,6 +440,9 @@ class CameraDevice:
     def disconnect(self) -> None:
         if not self._connected and not self._connecting:
             return
+        # Connecting covers both transitions per the Platform 7 async
+        # pattern; the worker clears it when the teardown completes.
+        self._connecting = True
         self._disconnect_thread = Thread(target=self._disconnect_worker, daemon=True)
         self._disconnect_thread.start()
 
@@ -618,8 +634,9 @@ class CameraDevice:
         )
 
         self._camera_state = CameraState.IDLE
-        self._image_ready = False
 
+        # ImageReady stays true until the next StartExposure — clients may
+        # fetch the image more than once (ImageArray then ImageArrayVariant).
         # Transpose from native (H, W) to ASCOM (W, H), preserving
         # native unsigned dtype (uint8 for MONO8/RAW8, uint16 for
         # MONO16/RAW16).
@@ -766,25 +783,50 @@ class CameraDevice:
         self, start_x=None, num_x=None, start_y=None, num_y=None
     ) -> None:
         """
-        Set ROI with proper validation.
+        Set ROI, stored as given.
 
-        All start/num values are in binned pixels per ASCOM spec.
-        xiAPI also works in binned pixels for width/height/offsetX/offsetY
-        (after downsampling is set), but requires each to be a multiple
-        of its own ":inc" increment, queried live below.
+        All start/num values are in binned pixels per ASCOM spec. Per the
+        ICameraV4 spec the setters accept any value; validation happens in
+        start_exposure, which must reject an illegal ROI combination and
+        applies the validated ROI to the camera.
         """
-        sx = start_x if start_x is not None else self._start_x
-        sy = start_y if start_y is not None else self._start_y
-        nx = num_x if num_x is not None else self._num_x
-        ny = num_y if num_y is not None else self._num_y
+        if start_x is not None:
+            self._start_x = start_x
+        if start_y is not None:
+            self._start_y = start_y
+        if num_x is not None:
+            self._num_x = num_x
+        if num_y is not None:
+            self._num_y = num_y
 
-        # Max binned dimensions (offsets zeroed first, where settable, so
-        # width:max / height:max report the full binned frame)
+    ###################
+    # ICamera methods #
+    ###################
+    def start_exposure(self, duration: float, light: bool) -> None:
+        if self._camera_state != CameraState.IDLE:
+            raise RuntimeError("Camera is not idle")
+        if duration < 0:
+            raise ValueError(f"Duration {duration} must be >= 0")
+        if duration > self._exposure_max:
+            raise ValueError(f"Duration {duration} above ExposureMax {self._exposure_max}")
+        sx, sy = self._start_x, self._start_y
+        nx, ny = self._num_x, self._num_y
+        if sx < 0 or sy < 0 or nx < 1 or ny < 1:
+            raise ValueError(f"Invalid ROI: start=({sx}, {sy}) num=({nx}, {ny})")
+
+        # Validate the ROI against the live binned geometry (offsets zeroed
+        # first, where settable, so width:max / height:max report the full
+        # binned frame), then apply it to the camera.
         if self._can_set_offset:
             self._set_int(XI_PRM.OFFSET_X, 0)
             self._set_int(XI_PRM.OFFSET_Y, 0)
         max_binned_x = self._get_int(XI_PRM.WIDTH + XI_PRM.INFO_MAX)
         max_binned_y = self._get_int(XI_PRM.HEIGHT + XI_PRM.INFO_MAX)
+        if sx + nx > max_binned_x or sy + ny > max_binned_y:
+            raise ValueError(
+                f"ROI start=({sx}, {sy}) num=({nx}, {ny}) "
+                f"exceeds frame {max_binned_x} x {max_binned_y}"
+            )
 
         # Cameras that don't implement size or offset can only deliver the
         # full frame; reject a request that would change the fixed axis
@@ -794,49 +836,24 @@ class CameraDevice:
         if not self._can_set_offset and (sx != 0 or sy != 0):
             raise ValueError("Camera does not support sub-frame offset")
 
-        # Validate and clamp start values
-        if sx < 0:
-            sx = 0
-        if sy < 0:
-            sy = 0
-        if sx >= max_binned_x:
-            sx = max_binned_x - 1
-        if sy >= max_binned_y:
-            sy = max_binned_y - 1
-
-        # Validate and clamp num values
-        max_nx = max_binned_x - sx
-        max_ny = max_binned_y - sy
-        if nx < 1:
-            nx = 1
-        if ny < 1:
-            ny = 1
-        if nx > max_nx:
-            nx = max_nx
-        if ny > max_ny:
-            ny = max_ny
-
-        # xiAPI alignment: each geometry parameter has its own increment
+        # xiAPI alignment: each geometry parameter has its own increment and
+        # minimum — reject rather than silently capture a clamped frame.
         width_inc = self._get_int_or(XI_PRM.WIDTH + XI_PRM.INFO_INCREMENT, 1) or 1
         height_inc = self._get_int_or(XI_PRM.HEIGHT + XI_PRM.INFO_INCREMENT, 1) or 1
         offset_x_inc = self._get_int_or(XI_PRM.OFFSET_X + XI_PRM.INFO_INCREMENT, 1) or 1
         offset_y_inc = self._get_int_or(XI_PRM.OFFSET_Y + XI_PRM.INFO_INCREMENT, 1) or 1
-
         min_nx = self._get_int_or(XI_PRM.WIDTH + XI_PRM.INFO_MIN, width_inc)
         min_ny = self._get_int_or(XI_PRM.HEIGHT + XI_PRM.INFO_MIN, height_inc)
-
-        nx = (nx // width_inc) * width_inc
-        ny = (ny // height_inc) * height_inc
-        if nx < min_nx:
-            nx = min_nx
-        if ny < min_ny:
-            ny = min_ny
-        sx = (sx // offset_x_inc) * offset_x_inc
-        sy = (sy // offset_y_inc) * offset_y_inc
-        if sx + nx > max_binned_x:
-            sx = ((max_binned_x - nx) // offset_x_inc) * offset_x_inc
-        if sy + ny > max_binned_y:
-            sy = ((max_binned_y - ny) // offset_y_inc) * offset_y_inc
+        if nx % width_inc or nx < min_nx or ny % height_inc or ny < min_ny:
+            raise ValueError(
+                f"NumX {nx} must be a multiple of {width_inc} (min {min_nx}) and "
+                f"NumY {ny} a multiple of {height_inc} (min {min_ny})"
+            )
+        if sx % offset_x_inc or sy % offset_y_inc:
+            raise ValueError(
+                f"StartX {sx} must be a multiple of {offset_x_inc} and "
+                f"StartY {sy} a multiple of {offset_y_inc}"
+            )
 
         # Set size first (offsets already zeroed where supported), then
         # position — each only when the camera implements it.
@@ -847,17 +864,6 @@ class CameraDevice:
             self._set_int(XI_PRM.OFFSET_X, sx)
             self._set_int(XI_PRM.OFFSET_Y, sy)
 
-        self._start_x = sx
-        self._start_y = sy
-        self._num_x = nx
-        self._num_y = ny
-
-    ###################
-    # ICamera methods #
-    ###################
-    def start_exposure(self, duration: float, light: bool) -> None:
-        if self._camera_state != CameraState.IDLE:
-            raise RuntimeError("Camera is not idle")
         self._image_ready = False
         self._abort_requested = False
         self._camera_state = CameraState.WAITING
@@ -926,6 +932,7 @@ class CameraDevice:
                 raw = rows.reshape(height, row_bytes)[:, : width * bytes_per_pixel].tobytes()
 
             self._image_buffer = raw
+            self._camera_state = CameraState.IDLE
             self._exposure_complete.set()
             self._image_ready = True
             logger.debug("image ready")
